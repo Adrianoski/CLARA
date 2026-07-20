@@ -8,7 +8,7 @@ relevant cluster agents per query; the **primary** agent handles retrieval
 and generation, while **secondary** agents contribute evidence through a
 dedicated inter-agent operation.
 
-![CLARA Architecture](CLARA_Architecture.png)
+![CLARA Architecture](CLARA_Architecture_official.png)
 
 ---
 
