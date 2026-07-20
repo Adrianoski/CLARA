@@ -151,14 +151,6 @@ def write_report(results, score_std, score_slm, score_full, metadata, output_pat
             f.write(f"| {label} | {_fmt(s)} | {_fmt(sl)} | {_fmt(fu)} "
                     f"| {_delta_str(s, sl)} | {_delta_str(s, fu)} |\n")
 
-        # Hallucination = 1 − Faithfulness
-        faith_key = "faithfulness"
-        hall_std  = 1 - means_std[faith_key]  if not math.isnan(means_std[faith_key])  else float("nan")
-        hall_slm  = 1 - means_slm[faith_key]  if not math.isnan(means_slm[faith_key])  else float("nan")
-        hall_full = 1 - means_full[faith_key] if not math.isnan(means_full[faith_key]) else float("nan")
-        f.write(f"| Hallucination *(1−Faith)* | {_fmt(hall_std)} | {_fmt(hall_slm)} | {_fmt(hall_full)} "
-                f"| {_delta_str(hall_std, hall_slm)} | {_delta_str(hall_std, hall_full)} |\n")
-
         f.write("\n---\n\n")
 
         # ── Metriche di efficienza ─────────────────────────────────────
@@ -168,7 +160,6 @@ def write_report(results, score_std, score_slm, score_full, metadata, output_pat
         f.write(f"| Generazione media | {std_gen:.0f} ms | {slm_gen:.0f} ms | {full_gen:.0f} ms |\n")
         f.write(f"| Pool medio | {std_pool:.0f} chunk | {slm_pool:.0f} chunk | {full_pool:.0f} chunk |\n")
         f.write(f"| Speedup retrieval | — | **{speedup_slm:.1f}x** | **{speedup_full:.1f}x** |\n")
-        f.write(f"| Keyword hit | {std_hr:.0f}% | {slm_hr:.0f}% | {full_hr:.0f}% |\n")
 
         f.write("\n---\n\n")
 
