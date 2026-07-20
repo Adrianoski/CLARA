@@ -1,13 +1,5 @@
 """
-benchmark.py — Confronto RAG standard vs SLM-routed retrieval.
-
-Metriche:
-  - Latenza media (ms) per query
-  - Dimensione del pool di ricerca (n. chunk esaminati)
-  - Overlap@5 tra i due sistemi (per stimare la qualità relativa)
-
-Uso:
-    python3 benchmark.py
+Benchmark script for comparing standard RAG retrieval vs SLM-routed retrieval.
 """
 
 import time
@@ -21,25 +13,19 @@ import chromadb
 from router import load_registry, find_top_n_slms
 
 # ── Config ─────────────────────────────────────────────────────────────
-TOP_N_SLMS        = 10
-TOP_K             = 10
+TOP_N_SLMS        = 15
+TOP_K             = 5
 RRF_K             = 60
-ROUTING_MODE      = "centroid"             # "summary" (keyword c-TF-IDF, contributo del paper) | "centroid" (baseline ablation)
-GENERATION_MODEL  = "Qwen/Qwen3.5-4B"    # modello HuggingFace per la generazione
+ROUTING_MODE      = "summary"             
+GENERATION_MODEL  = "Qwen/Qwen3.5-4B"    
 MAX_NEW_TOKENS    = 256
-MAX_INPUT_TOKENS  = 131072                  # capped per stare nei 16GB di VRAM disponibili: con i cluster K-Means
-                                           # (centinaia-migliaia di chunk ciascuno, non più capitoli di libro) la
-                                           # modalità SLM-Full può passare un pool enorme al generatore; un contesto
-                                           # vicino a 131072 token causa CUDA OOM su questa GPU (16GB) con Qwen3.5-4B
+MAX_INPUT_TOKENS  = 16384                  
+                                           
+                                           
+                                           
 OUTPUT_FILE       = f"{MAX_INPUT_TOKENS}_benchmark_answers_spacy_4B_3_WAYS_arxiv2000_{TOP_N_SLMS}_SLM_TOP_K_{TOP_K}_ROUTING_{ROUTING_MODE}.md"
 
-# Ogni query è stata verificata leggendo direttamente i chunk reali (via
-# ChromaDB) del paper arXiv citato, dopo l'ingestion dei 2000 paper di
-# armanc/scientific_papers (config 'arxiv', split 'train' — vedi app.py).
-# Le expected_kws sono sottostringhe letterali presenti nel testo del chunk
-# (il corpus è già tutto minuscolo e con spazi attorno ai trattini, es.
-# "sub - kiloparsec", non "sub-kiloparsec": le keyword rispettano questa
-# formattazione per matchare correttamente in hit_rate()).
+
 QUERIES = [
     (
         "paper_000045",
@@ -590,7 +576,16 @@ def main():
 
         docs_std, ids_std, pool_std, t_std = retrieve_standard(query, q_emb, chroma_client)
         docs_slm,  pool_slm,  t_slm  = retrieve_slm(query, q_emb, registry, chroma_client)
-        docs_full, pool_full, t_full = retrieve_slm_full(q_emb, registry, chroma_client)
+
+        # SLM-Full disattivato: con i cluster attuali (centinaia-migliaia di
+        # chunk) il pool senza reranking supera di gran lunga il contesto del
+        # generatore e viene troncato ad-hoc, producendo risposte quasi sempre
+        # sbagliate (1/20 nei run precedenti) e allungando di molto ogni query
+        # (generazione più lenta di StdRAG e SLM-RAG messi insieme). Placeholder
+        # a costo zero sotto, così il resto dello script (aggregati, markdown,
+        # JSON) continua a funzionare senza modifiche.
+        # docs_full, pool_full, t_full = retrieve_slm_full(q_emb, registry, chroma_client)
+        docs_full, pool_full, t_full = [], 0, 0.0
 
         overlap = len(set(docs_std[:TOP_K]) & set(docs_slm[:TOP_K])) / TOP_K * 100
         hr_std  = hit_rate(docs_std,  expected_kws)
@@ -610,7 +605,7 @@ def main():
 
         print(f"  Retrieval  —  StdRAG: {t_std:.1f}ms (pool={pool_std})  |  "
               f"SLM-RAG: {t_slm:.1f}ms (pool={pool_slm})  |  "
-              f"SLM-Full: {t_full:.1f}ms (pool={pool_full})  speedup={speedup:.1f}x")
+              f"SLM-Full: disattivato  speedup={speedup:.1f}x")
         print(f"  Generazione StdRAG...")
         t_gen0 = time.perf_counter()
         ans_std = generate(query, docs_std, GENERATION_MODEL)
@@ -621,17 +616,17 @@ def main():
         ans_slm = generate(query, docs_slm, GENERATION_MODEL)
         t_gen_slm = (time.perf_counter() - t_gen0) * 1000
 
-        print(f"  Generazione SLM-Full...")
-        t_gen0 = time.perf_counter()
-        ans_full = generate(query, docs_full, GENERATION_MODEL)
-        t_gen_full = (time.perf_counter() - t_gen0) * 1000
+        # print(f"  Generazione SLM-Full...")
+        # t_gen0 = time.perf_counter()
+        # ans_full = generate(query, docs_full, GENERATION_MODEL)
+        # t_gen_full = (time.perf_counter() - t_gen0) * 1000
+        ans_full, t_gen_full = "", 0.0
 
         std_gens.append(t_gen_std); slm_gens.append(t_gen_slm); full_gens.append(t_gen_full)
 
-        print(f"  Gen times  —  StdRAG: {t_gen_std:.0f}ms  |  SLM-RAG: {t_gen_slm:.0f}ms  |  SLM-Full: {t_gen_full:.0f}ms")
+        print(f"  Gen times  —  StdRAG: {t_gen_std:.0f}ms  |  SLM-RAG: {t_gen_slm:.0f}ms  |  SLM-Full: disattivato")
         print(f"  StdRAG  : {ans_std[:100]}…")
         print(f"  SLM-RAG : {ans_slm[:100]}…")
-        print(f"  SLM-Full: {ans_full[:100]}…")
 
         md_rows.append({
             "paper_id":     paper_id,
@@ -642,7 +637,7 @@ def main():
             "ans_full":     ans_full,
             "cls_std":      classify_answer(ans_std),
             "cls_slm":      classify_answer(ans_slm),
-            "cls_full":     classify_answer(ans_full),
+            "cls_full":     "DISATTIVATO",  # SLM-Full non eseguito, vedi commento sopra
             "docs_std":     docs_std,
             "docs_slm":     docs_slm,
             "docs_full":    docs_full,
@@ -669,25 +664,32 @@ def main():
     avg_speedup_full   = np.mean(std_times) / np.mean(full_times) if np.mean(full_times) > 0 else 0.0
     pool_reduction     = (1 - np.mean(slm_pools)  / np.mean(std_pools)) * 100
     pool_reduction_full= (1 - np.mean(full_pools) / np.mean(std_pools)) * 100
+    avg_ret_std        = np.mean(std_times)   # LAT-STD:   avg. retrieval latency of StdRAG (ms)
+    avg_ret_slm        = np.mean(slm_times)   # LAT-CLARA: avg. retrieval latency of CLARA/SLM-RAG (ms)
+    avg_ret_full       = np.mean(full_times)
 
     def _count_true_answers(key):
         return sum(1 for r in md_rows if r[key] == "RISPOSTA")
 
-    n_q = len(md_rows)
+    n_q = len(md_rows)  # NQ: number of queries in the query set
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(f"# Benchmark RAG — {', '.join(col_names)}\n\n")
         f.write(f"**Modello:** {GENERATION_MODEL}  |  **top-k:** {TOP_K}  |  **top-N SLM:** {TOP_N_SLMS}  |  **routing:** {ROUTING_MODE}\n\n")
         f.write(f"| Metrica | StdRAG | SLM-RAG | SLM-Full |\n|---|---|---|---|\n")
-        f.write(f"| Risposte vere | **{_count_true_answers('cls_std')}/{n_q}** | **{_count_true_answers('cls_slm')}/{n_q}** | **{_count_true_answers('cls_full')}/{n_q}** |\n")
-        f.write(f"| Speedup retrieval | — | **{avg_speedup:.1f}x** | **{avg_speedup_full:.1f}x** |\n")
+        f.write(f"| Query (NQ) | {n_q} | {n_q} | {n_q} |\n")
+        f.write(f"| Risposte vere | **{_count_true_answers('cls_std')}/{n_q}** | **{_count_true_answers('cls_slm')}/{n_q}** | disattivato |\n")
+        f.write(f"| Retrieval latency (avg, ms) | **{avg_ret_std:.1f}** | **{avg_ret_slm:.1f}** | — |\n")
+        f.write(f"| Speedup retrieval | — | **{avg_speedup:.1f}x** | — |\n")
         f.write(f"| Pool medio | {int(np.mean(std_pools))} chunk "
                 f"| {int(np.mean(slm_pools))} chunk (-{pool_reduction:.0f}%) "
-                f"| {int(np.mean(full_pools))} chunk ({pool_reduction_full:+.0f}%) |\n")
-        f.write(f"| Generazione media | {np.mean(std_gens):.0f} ms | {np.mean(slm_gens):.0f} ms | {np.mean(full_gens):.0f} ms |\n")
-        f.write(f"| Keyword hit | {np.mean(std_hits):.0f}% | **{np.mean(slm_hits):.0f}%** | {np.mean(full_hits):.0f}% |\n")
+                f"| — |\n")
+        f.write(f"| Generazione media | {np.mean(std_gens):.0f} ms | {np.mean(slm_gens):.0f} ms | — |\n")
+        f.write(f"| Keyword hit | {np.mean(std_hits):.0f}% | **{np.mean(slm_hits):.0f}%** | — |\n")
         f.write(f"| Overlap medio top-{TOP_K} (Std vs SLM) | {np.mean(overlaps):.0f}% | — | — |\n")
         f.write(f"| Routing recall @3 / @5 | — | {np.mean(recalls3):.0f}% / {np.mean(recalls5):.0f}% | idem |\n\n")
+        f.write(f"<!-- LaTeX placeholders: [TBD:NQ]={n_q}  "
+                f"[TBD:LAT-STD]={avg_ret_std:.1f}ms  [TBD:LAT-CLARA]={avg_ret_slm:.1f}ms -->\n\n")
         f.write("---\n\n")
 
         for i, r in enumerate(md_rows, 1):
@@ -715,11 +717,15 @@ def main():
     json_path = OUTPUT_FILE.replace(".md", f"_results.json")
     json_data = {
         "metadata": {
-            "collections":  col_names,
-            "model":        GENERATION_MODEL,
-            "top_k":        TOP_K,
-            "top_n_slm":    TOP_N_SLMS,
-            "routing_mode": ROUTING_MODE,
+            "collections":       col_names,
+            "model":             GENERATION_MODEL,
+            "top_k":             TOP_K,
+            "top_n_slm":         TOP_N_SLMS,
+            "routing_mode":      ROUTING_MODE,
+            "n_queries":         n_q,               # NQ
+            "avg_ret_ms_std":    round(avg_ret_std, 1),   # LAT-STD
+            "avg_ret_ms_slm":    round(avg_ret_slm, 1),   # LAT-CLARA
+            "avg_ret_ms_full":   round(avg_ret_full, 1),
         },
         "results": [
             {
@@ -765,22 +771,21 @@ def main():
         json.dump(json_data, f, ensure_ascii=False, indent=2)
     print(f"JSON salvato:  {json_path}")
     print(f"\nRIEPILOGO  (routing={ROUTING_MODE})")
+    print(f"  NQ (numero query)     : {n_q}")
     print(f"  Risposte vere StdRAG  : {_count_true_answers('cls_std')}/{n_q}")
     print(f"  Risposte vere SLM-RAG : {_count_true_answers('cls_slm')}/{n_q}")
-    print(f"  Risposte vere SLM-Full: {_count_true_answers('cls_full')}/{n_q}")
+    print(f"  Risposte vere SLM-Full: disattivato")
     print(f"  Routing recall @3 / @5 : {np.mean(recalls3):.0f}% / {np.mean(recalls5):.0f}%")
+    print(f"  Retrieval latency (avg) StdRAG    [LAT-STD]   : {avg_ret_std:.1f} ms")
+    print(f"  Retrieval latency (avg) SLM-RAG   [LAT-CLARA] : {avg_ret_slm:.1f} ms")
     print(f"  Speedup retrieval SLM-RAG  : {avg_speedup:.1f}x")
-    print(f"  Speedup retrieval SLM-Full : {avg_speedup_full:.1f}x")
     print(f"  Pool medio  StdRAG  : {int(np.mean(std_pools))} chunk")
     print(f"  Pool medio  SLM-RAG : {int(np.mean(slm_pools))} chunk  ({pool_reduction:+.0f}%)")
-    print(f"  Pool medio  SLM-Full: {int(np.mean(full_pools))} chunk  ({pool_reduction_full:+.0f}%)")
     print(f"  Generazione StdRAG  : {np.mean(std_gens):.0f} ms")
     print(f"  Generazione SLM-RAG : {np.mean(slm_gens):.0f} ms")
-    print(f"  Generazione SLM-Full: {np.mean(full_gens):.0f} ms")
     print(f"  Overlap medio top-{TOP_K}  : {np.mean(overlaps):.0f}%")
     print(f"  Keyword hit StdRAG  : {np.mean(std_hits):.0f}%")
     print(f"  Keyword hit SLM-RAG : {np.mean(slm_hits):.0f}%")
-    print(f"  Keyword hit SLM-Full: {np.mean(full_hits):.0f}%")
 
 
 if __name__ == "__main__":

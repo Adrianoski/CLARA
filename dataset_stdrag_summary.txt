@@ -1,0 +1,306 @@
+ARXIV DATASET
+=============
+
+The validation corpus chosen is armanc/scientific_papers, a dataset
+published on Hugging Face and originally built by Cohan et al. (2018) for
+the long-document scientific summarization benchmark. The dataset collects
+papers extracted from arXiv (the "arxiv" configuration used here) and from
+PubMed OpenAccess ("pubmed" configuration, not used in this work), and is
+typically employed in the literature to evaluate abstractive summarization
+models on documents of considerable length. For this study, a sample of
+2,000 papers was extracted from the "train" split of the arxiv
+configuration, chosen without topical filtering: the resulting sample
+therefore heterogeneously covers the areas most typically represented on
+arXiv, in particular astrophysics, particle and condensed-matter physics,
+pure and applied mathematics, and to a lesser extent computer science and
+other quantitative disciplines.
+
+Each dataset record consists of three text fields: the full body of the
+paper (article), the abstract (abstract), and the list of section titles
+(section_names). A characteristic relevant to preprocessing is that the
+body text is not the original PDF, but a version derived from the LaTeX
+source in which formulas and equations have been replaced by placeholder
+tokens (e.g. @xmath12) and bibliographic references by the @xcite token;
+the text is also entirely lowercase and shows non-standard spacing around
+punctuation, inherited from the tokenization process used to prepare the
+original dataset. This characteristic made a dedicated cleaning step
+necessary before keyword extraction for semantic routing (see Section 3),
+since such placeholders would otherwise tend to be extracted as spurious
+distinctive terms.
+
+Starting from this text corpus, the pipeline applies adaptive chunking
+("paper" profile, target width of about 800 characters per chunk) and
+computes a dense embedding for each chunk using the multilingual model
+BAAI/bge-m3. The result is an index of about 143,000 chunks, subsequently
+organized into semantic clusters (called SLMs, Semantic Language Model /
+cluster) via a batch clustering algorithm (MiniBatchKMeans), with an
+additional recursive splitting step for clusters exceeding a maximum size
+threshold, so as to obtain clusters of more homogeneous size than a plain
+single-pass K-Means would produce. On this 2,000-paper / 143,086-chunk
+corpus, this procedure produces 204 clusters (mean size 701 chunks, median
+655, largest 1,298, smallest 2) — see "Number of clusters produced" below
+for the full breakdown and its implications for scalability.
+
+
+3. IMPLEMENTATION DETAILS / HYPERPARAMETERS (fills R3's requested numbers)
+============================================================================
+
+This section reports, explicitly, every numeric parameter governing
+clustering, routing and retrieval, as requested by reviewer R3. All values
+are read directly from the implementation, not estimated.
+
+3.1 Chunking profiles.
+The chunking step is adaptive: the document type is heuristically detected
+and a type-specific (chunk_size, chunk_overlap) pair is applied, using a
+recursive character splitter with separators ["\n\n", "\n", ".", " ", ""].
+
+  document type   chunk_size (chars)   chunk_overlap (chars)
+  paper                    800                   100
+  book                    1500                   150
+  technical               1200                   200
+  generic                 1500                   150
+
+The arXiv corpus uses the "paper" profile throughout (800 / 100), since
+every record is a scientific-paper body by construction.
+
+3.2 Clustering: two regimes, and why.
+Two distinct clustering mechanisms exist in the implementation, used in
+different regimes:
+
+  (a) Incremental threshold-based assignment (the general CLARA mechanism,
+      used for streaming / single-document ingestion). Each new chunk is
+      assigned to the existing SLM whose centroid has the highest cosine
+      similarity, provided that similarity is >= tau_rel (the assignment
+      threshold); otherwise a new SLM is created, seeded by that chunk.
+      Two SLMs whose centroids have cosine similarity >= the merge
+      threshold are subsequently merged, keeping the larger of the two.
+
+        tau_rel (assignment threshold)  default = 0.65  (code: router.py,
+                                          assign_chunk(), parameter
+                                          "threshold")
+        merge threshold                 default = 0.90  (code: router.py,
+                                          merge_close_slms(), parameter
+                                          "threshold")
+
+  (b) Batch clustering with a recursive size cap (used specifically for
+      the arXiv corpus). Chunk embeddings are clustered in one pass with
+      MiniBatchKMeans into an initial target number of clusters; every
+      resulting cluster whose size exceeds tau_size is recursively
+      re-clustered internally until all clusters satisfy the cap.
+
+        target initial cluster count (K)   150   (code: recluster.py,
+                                                   N_CLUSTERS)
+        tau_size (max chunks per SLM)      1300  (code: recluster.py,
+                                                   MAX_CHUNKS_PER_SLM)
+
+  Why two regimes: on this corpus, regime (a) was tested at tau_rel = 0.55
+  and tau_rel = 0.75. At 0.55, 98.9% of all chunks collapsed into a single
+  SLM (100,431 of 101,542 chunks then indexed): the mostly-boilerplate,
+  LaTeX-derived text of heterogeneous arXiv papers is similar enough in
+  embedding space that a permissive threshold merges nearly everything
+  into one attractor. At 0.75, the opposite failure occurred: roughly
+  13-14 SLMs were created per paper, extrapolating to ~27,000 SLMs over
+  2,000 papers — far too many for the merge step (itself O(n^2) per merge
+  found) to consolidate in tractable time, and too fragmented to be
+  useful clusters. Regime (b) was adopted instead specifically for this
+  large, topically heterogeneous corpus, and is documented here as a
+  corpus-scale adaptation of the general CLARA clustering mechanism (a),
+  which remains the default for the streaming/single-document case.
+
+3.3 Relevance score.
+Throughout the retrieval pipeline (routing, dense ranking, and clustering
+similarity), the relevance score between any two embedded items is cosine
+similarity: score(u, v) = (u . v) / (||u|| ||v||), computed on L2-normalized
+embeddings from BAAI/bge-m3.
+
+3.4 Keyword profile / routing parameters.
+Each SLM's routing profile is built from its most distinctive keywords,
+extracted with spaCy from the (LaTeX/arXiv-artifact-cleaned) text of its
+member chunks, and weighted with a cross-cluster c-TF-IDF scheme: a
+keyword's score in cluster c is its in-cluster count multiplied by
+log((1 + N) / (1 + df)), where N is the total number of clusters and df is
+the number of clusters in which the keyword appears at all. This penalizes
+keywords generic across many clusters and rewards those distinctive of a
+single cluster.
+
+  CTFIDF_TOP_K (keywords retained per cluster profile)       25
+  CTFIDF_MIN_COUNT (min in-cluster occurrences to be
+                     eligible for the c-TF-IDF ranking)        3
+  SLM_SUMMARY_EVERY_N (regime (a) only: chunks added
+                        before an in-flight summary refresh)  20
+
+Each retained keyword is embedded individually (not concatenated into a
+single string); the cluster's routing score for a query is the mean of
+the cosine similarities between the query embedding and the cluster's
+keyword embeddings (an alternative, centroid-based routing mode, scoring
+each cluster by cosine similarity to its centroid embedding rather than
+its keyword profile, is also implemented and used as an ablation
+baseline — see Results below for which mode produced the reported run).
+
+3.5 Retrieval parameters.
+  RRF_K (Reciprocal Rank Fusion constant)         60
+  top-N SLM (clusters selected by routing)        run-dependent, see
+                                                    Results section
+  top-K (chunks passed to the generator after
+         fusion)                                  run-dependent, see
+                                                    Results section
+
+3.6 Generation parameters.
+  model            Qwen/Qwen3.5-4B
+  decoding         greedy (do_sample = False)
+  max new tokens   256
+  prompt template  identical for StdRAG and CLARA (SLMAgent.build_messages)
+
+
+4. BASELINE DEFINITION
+========================
+
+4.1 Definition of StdRAG.
+StdRAG (Standard RAG) is not an external system but a controlled ablation
+of CLARA with routing disabled. Every component of the pipeline is held
+identical between StdRAG and CLARA except the search pool that is
+retrieved from; this isolates the effect of semantic routing as the sole
+independent variable in the comparison.
+
+Specifically, StdRAG and CLARA share:
+  - the same chunking pipeline and per-type profiles (Section 3.1);
+  - the same embedding model (BAAI/bge-m3) for both indexing and query
+    encoding;
+  - the same underlying vector store (a ChromaDB collection);
+  - the same hybrid retrieval mechanism: a dense ranking (cosine
+    similarity, Section 3.3) and a lexical BM25 ranking, fused via
+    Reciprocal Rank Fusion with the same constant RRF_K = 60 (Section
+    3.5);
+  - the same top-K cutoff applied to the fused ranking before the chunks
+    are handed to the generator;
+  - the same generative model and decoding parameters (Section 3.6),
+    including an identical prompt template.
+
+The single difference is the pool that the dense+BM25+RRF retrieval step
+is run over. For CLARA, the pool is the union of the top-N SLM clusters
+selected by semantic routing (a strict subset of the corpus, typically a
+few percent of it — see the running example in Section 5). For StdRAG,
+routing is disabled and the pool is instead the entire indexed corpus: all
+~143,000 chunks, retrieved via an exact (flat, non-approximate) cosine
+similarity computation over every embedding in the collection — i.e. an
+exhaustive nearest-neighbour search, not an ANN index such as HNSW or
+FAISS, so that StdRAG's retrieval quality is not itself limited by
+approximation error and represents a genuine upper bound.
+
+Because StdRAG and CLARA are identical in every respect except the search
+pool, any difference observed between them in retrieval latency, pool
+size, or answer quality can be attributed specifically to the effect of
+semantic routing, rather than to confounding differences in chunking,
+embedding, fusion, or generation.
+
+
+NUMBER OF CLUSTERS PRODUCED
+============================
+
+On the 2,000-paper / 143,086-chunk arXiv sample, the batch clustering
+procedure produces 204 final SLM clusters. Their size
+distribution: mean 701 chunks, median 655, largest 1,298 chunks, smallest
+2 chunks. This demonstrates the clustering step scaling from
+the original single-document use case (tens of SLMs, one per book
+chapter) to a 2,000-document / 143k-chunk heterogeneous corpus while
+keeping every cluster within a bounded, near-uniform size — the property
+that keeps downstream routing and retrieval costs predictable as the
+corpus grows.
+
+
+5. RESULTS FROM THE LATEST RUN (speedup)
+==========================================
+
+Configuration: top-N SLM = 15, top-K chunks = 5, generation context =
+16,384 tokens, keyword-based routing (summary embedding, c-TF-IDF).
+
+Retrieval speedup:
+  - SLM-RAG   :  11.8x faster than StdRAG
+
+Average pool queried per query:
+  - StdRAG    : 143,086 chunks (100% of the corpus)
+  - SLM-RAG   : 11779 chunks  
+
+Average generation time:
+  - StdRAG    : 2861 ms
+  - SLM-RAG   : 2485 ms
+
+
+6. ROUTING RUNNING EXAMPLE
+============================
+
+Below is a step-by-step walkthrough of the routing and retrieval flow for
+a real benchmark query, with the values actually produced by the system
+(204-SLM registry, keyword-based routing). The query concerns the content
+of paper "paper_000219", about photon emission from quantum dots.
+
+Query:
+  "How does resonant excitation improve the spectral linewidth of photons
+   emitted by a quantum dot?"
+
+Step 1 — Query embedding.
+The query is encoded with the same embedding model used at indexing time
+(BAAI/bge-m3), producing a normalized dense vector q_emb in the same
+vector space in which both the corpus chunks and the clusters' semantic
+profiles live.
+
+Step 2 — Comparison against the clusters' semantic profiles (routing).
+Each SLM has a routing profile built from its most distinctive keywords
+(Section 3.4). Each keyword in the profile is embedded individually; the
+cluster's routing score is the mean of the cosine similarities between
+q_emb and its keyword embeddings. Across the registry's 204 clusters, the
+five highest scores obtained for this query were:
+
+  rank  SLM            score    n. chunks  example keywords
+  1     slm_c98064bb   0.3776   908        coulomb photon exchange,
+                                            rayleigh scattering cross
+                                            sections, photoelectron
+  2     slm_d0d3f6c1   0.3750   922        radiofrequency, hf radio
+                                            signal, wakefield
+  3     slm_42cfc9c3   0.3684   749        laser linewidths, opo
+                                            cavity linewidth,
+                                            photoelectron
+  4     slm_5ed7c2b7   0.3669   1078       nir image processing,
+                                            gaia g band photometry
+  5     slm_6d21655e   0.3657   510        quantum state engineering,
+                                            photon quadrature,
+                                            beamsplitter
+
+Step 3 — Top-N selection and pool composition.
+With top-N = 3, clusters slm_c98064bb, slm_d0d3f6c1 and slm_42cfc9c3 are
+selected as the search pool for this query. Their union amounts to 2,579
+chunks, roughly 1.8% of the entire corpus (143,086 chunks): this is the
+subset that will actually be queried, instead of the full index as StdRAG
+would do.
+
+Step 4 — Hybrid retrieval within the pool.
+Within the 2,579 selected chunks, the same hybrid retrieval scheme used by
+StdRAG is run, but limited to the pool (Section 4.1): a dense ranking
+(cosine similarity between q_emb and each pool chunk's embedding) and a
+lexical BM25 ranking over the chunks' text, fused via Reciprocal Rank
+Fusion (RRF, k = 60). The top-ranked chunk indeed comes from slm_c98064bb,
+has cosine similarity 0.658 with the query, and its text is:
+
+  "in our experiment, we begin with an optical characterization of the qds
+   and observe a significantly reduced spectral linewidth of the emitted
+   photons from a resonantly driven single qd compared with incoherent
+   excitation methods..."
+
+— a genuine excerpt from paper_000219, i.e. exactly the document the query
+refers to: routing correctly directed the search toward the cluster that
+held the relevant information, even though its keyword profile at first
+glance ("coulomb photon exchange", "rayleigh scattering cross sections")
+would not seem the most obvious match — the keywords nonetheless share the
+vocabulary of photon physics, which is enough for the comparison in
+embedding space to work correctly.
+
+Step 5 — Answer generation.
+The chunks selected in step 4 (up to top-K) are finally passed, in the
+prompt, to the generative model (Qwen3.5-4B) together with the original
+query, which produces the final answer based only on this restricted
+context rather than on the entire corpus (Section 3.6).
+
+The overall cost of the retrieval operation for this query is therefore
+limited to 1.8% of the total corpus (2,579 chunks versus StdRAG's
+143,086), while still correctly retrieving the chunk most relevant to the
+question.
