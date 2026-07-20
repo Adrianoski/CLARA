@@ -1,0 +1,31 @@
+nohup: ignoring input
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+[refresh] 72 SLM nel registry, rigenero keyword + summary embedding...
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|██████████| 391/391 [00:00<00:00, 80966.32it/s]
+[router] spaCy inizializzato con 'en_core_web_lg'.
+[router] Modello summary deallocato.
+[refresh] Completato: 72 SLM aggiornati.
+
+slm_69ad5901  (14919 chunk)
+  keywords: ["barrett - crane partition function", "the fe point of view", "morse theoretic proof of lemma", "vectoriel considr comme espace affine", "theoremasnorm", "the mbius inversion formula", "lowercase", "domaine - de - definition", "densitybasecondition", "ghostnumberone", "towardindexstatement", "the ricci equations", "propositionintegral", "martin - lf type theory", "dun groupe analogue en caractristique"]
+
+slm_156f182e  (14265 chunk)
+  keywords: ["the generalized langevin equation", "the holstein polaron wave function", "toda lattice analytical solutions", "dun terme cintique analogue", "the lagrangian formulation of mechanics", "the motional electric field", "defrndsorderfunction", "the lagrangian of the model", "the atmospheric coherence times", "dirac s value", "resultparticle", "anomalousdimmatrix", "the hls description s gauge", "staircase", "stressmomentum"]
+
+slm_d2216aa3  (13166 chunk)
+  keywords: ["the josephson coupling energy", "digital electronics band", "the intersite magnetic exchange interaction", "tomsk state university", "fermi - dirac distribution function", "the -meson compton wavelength fm", "heteronuclear systems", "the streamer electric field", "nanophase structures", "thomas - fermi model", "standard cdm power spectrum", "afm3 of case2", "the -type interatomic exchange facilitates", "the quadrimer structure gradually organizes", "ineffectiveness"]
+
+slm_e2b175b5  (11706 chunk)
+  keywords: ["magellanic stream models", "the symmetric cauchy distribution", "c12pc80value", "schechter function description", "datumdiffer", "combinedtimeserie", "transcriptionresult", "schechter parameterisation", "cs inversion algorithm", "reynolds number atmospheric boundary", "case1result", "cellcyclecheckpoint", "dgapproxerror", "chanceprobability", "monte carlo simulation methods"]
+
+slm_9d725214  (6072 chunk)
+  keywords: ["the sw radio source", "lyman series lines", "vb photoemission study", "modelespec", "the assumed metagalactic uv flux", "the grb photon spectrum", "starburst systems", "spacedensity", "feii redshift", "gaia wd for photometric calibration", "isoluminosity", "resultscomp", "the phoenix spectral library", "hst acs v - band", "batse lad discriminator lightcurves"]
+
+slm_fd7da5c7  (4566 chunk)
+  keywords: ["temperaturestrongint", "global sfr surface density", "coulomb energy exchange", "fermi - dirac distribution function", "sechpmodelmic", "phasecoeftab", "numericalresult", "xvii emission lines", "la sr cuo systems", "monte carlo radiation field", "the polish state committee", "the boltzmann equation for radiation", "disordering", "centimeter", "case2"]
+
+slm_2b39518a  (2458 chunk)
+  keywords: ["nonextensive systems", "subsecmergemodel", "internetworking", "colorado state university", "quantum electrodynamics", "the langevin equation of motion", "quantum communication technology", "sunada study lattice", "transitionless", "fitnessfunction", "hershfield", "disordering", "interphase", "overdetermination", "helicase"]
+
+slm_d4e8bb94  (2381 chunk)
+  keywords: ["rayleigh scattering cross section per", "the us department of energy", "the cmb photon energy", "dileptonproduction", "the nucleon electromagnetic structure", "susa model", "multihypernucleus", "selfinteraction", "postprocessing", "protoneutron", "monte carlo events", "subcollision", "muonfluxes", "the partonic cross section", "gev pion beam energy of"]

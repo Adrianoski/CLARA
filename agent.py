@@ -23,8 +23,6 @@ RankedChunk = Tuple[Chunk, float]       # (chunk, relevance_score)
 EvidenceSet = List[Chunk]
 
 
-# ── Tokenization (matches the convention used in app.py / benchmark.py) ─
-
 def _tokenize(text: str) -> List[str]:
     return re.sub(r"[^\w\s]", " ", text.lower()).split()
 
@@ -42,8 +40,6 @@ def _rrf(rankings: List[List[int]], k: int = 60) -> List[int]:
 
 @dataclass
 class ClusterAgent:
-
-
     name: str
     collection_name: str
     chunk_ids: List[str]

@@ -8,10 +8,11 @@ import json
 import numpy as np
 import torch
 
-from chunking import process_pdf
+from chunking import process_text
 from router import (
     assign_chunks_auto, load_registry, merge_close_slms, find_top_n_slms,
-    migrate_centroids_to_summaries, refresh_all_summaries, make_spacy_summary_fn
+    migrate_centroids_to_summaries, refresh_all_summaries, make_spacy_summary_fn,
+    _batched, CHROMA_GET_BATCH_SIZE,
 )
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -32,65 +33,208 @@ RRF_K = 60
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _model_cache: Dict = {}
 
+# ── HuggingFace dataset ingestion ───────────────────────────────────────
+# Sostituisce l'upload manuale di PDF: i documenti vengono presi direttamente
+# da https://huggingface.co/datasets/armanc/scientific_papers e passati alla
+# stessa pipeline di chunking/embedding/SLM clustering usata in precedenza.
 
-# ── Ingestion ──────────────────────────────────────────────────────────
-
-def get_registry_display() -> str:
-    registry = load_registry()
-    if not registry:
-        return "Registry vuoto."
-    lines = []
-    for slm_name, entry in registry.items():
-        summary_preview = entry.get("topic_summary", "—")[:80]
-        lines.append(
-            f"{slm_name}\n"
-            f"  chunks     : {entry['chunk_count']}\n"
-            f"  collection : {entry['collection']}\n"
-            f"  summary    : {summary_preview}…\n"
-        )
-    return "\n".join(lines)
-
-
-def get_collections():
-    return [c.name for c in chroma_client.list_collections()]
+HF_DATASET_NAME      = "armanc/scientific_papers"
+HF_DATASET_CONFIG    = "arxiv"
+HF_DATASET_SPLIT     = "train"
+HF_COLLECTION_NAME   = "scientific_papers_arxiv"
+MAX_DOCS             = 2000    # None = processa l'intero split (può richiedere ore)
+# NB: con corpus arXiv eterogenei il testo derivato da LaTeX (token @xmath/@xcite
+# ripetuti ovunque) tende ad avere coseno alto anche tra paper non correlati.
+# Con la soglia 0.55/0.88 usata per i PDF, un solo SLM ha finito per assorbire
+# il 98.9% dei chunk ("rich get richer" sul centroide). 0.75/0.95 sono i valori
+# validati in recluster.py per ottenere cluster più distinti su questo dataset.
+ASSIGN_THRESHOLD     = 0.75
+MERGE_THRESHOLD      = 0.95
+REFRESH_EVERY_N_DOCS = 50      # ogni quanti paper rilanciare merge + refresh summary
+SPACY_SUMMARY_MODEL  = "en_core_web_lg"  # il dataset è in inglese (vedi it_core_news_lg per i PDF)
 
 
-def upload_and_chunk(pdf_file, collection_name):
-    if pdf_file is None:
-        return "Nessun file caricato.", "", gr.update(choices=get_collections()), get_registry_display()
-    if not collection_name.strip():
-        return "Inserisci un nome per la collection.", "", gr.update(choices=get_collections()), get_registry_display()
+HF_RAW_ZIP_URLS = {
+    "arxiv":  "https://s3.amazonaws.com/datasets.huggingface.co/scientific_papers/1.1.1/arxiv-dataset.zip",
+    "pubmed": "https://s3.amazonaws.com/datasets.huggingface.co/scientific_papers/1.1.1/pubmed-dataset.zip",
+}
+HF_RAW_CACHE_DIR = Path.home() / ".cache" / "huggingface" / "scientific_papers_raw"
 
-    col_name = collection_name.strip()
+
+def _download_with_resume(url: str, dest_path: Path, chunk_size: int = 1 << 20,
+                           max_attempts: int = 30, timeout: int = 60) -> None:
+    """
+    Scarica url in dest_path riprendendo da dove si era interrotto in caso di
+    errore (HTTP Range), invece di ripartire da zero come fa il DownloadManager
+    di `datasets` — impraticabile per un file di ~3.6GB su una connessione
+    lenta/instabile.
+    """
+    import time
+    import requests
+    from tqdm import tqdm
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
+
+    for attempt in range(1, max_attempts + 1):
+        resume_from = tmp_path.stat().st_size if tmp_path.exists() else 0
+        headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+                if resume_from and r.status_code == 200:
+                    # server non supporta i Range: si riparte da zero
+                    resume_from = 0
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0)) + resume_from
+                mode = "ab" if resume_from else "wb"
+                with open(tmp_path, mode) as f, tqdm(
+                    total=total or None, initial=resume_from, unit="B", unit_scale=True,
+                    unit_divisor=1024, desc=dest_path.name,
+                ) as bar:
+                    for chunk in r.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            bar.update(len(chunk))
+            tmp_path.replace(dest_path)
+            return
+        except (requests.exceptions.RequestException, OSError) as e:
+            downloaded_mb = (tmp_path.stat().st_size / 1e6) if tmp_path.exists() else 0
+            wait = min(30, 2 ** attempt)
+            print(
+                f"[hf-ingest] download interrotto ({e}); {downloaded_mb:.0f}MB scaricati finora, "
+                f"riprovo tra {wait}s (tentativo {attempt}/{max_attempts})..."
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(f"Impossibile scaricare {url} dopo {max_attempts} tentativi.")
+
+
+def _iter_scientific_papers(config_name: str, split: str):
+    """
+    Itera gli esempi (article/abstract/section_names) di armanc/scientific_papers
+    per la config/split richiesti.
+
+    Non passa da load_dataset() né dal Builder class di `datasets`: quel dataset
+    è distribuito come 'dataset script' legacy (bloccato da datasets>=4) e il suo
+    DownloadManager comunque riparte sempre da zero se una richiesta si interrompe.
+    Scarichiamo quindi noi stessi (con resume) lo zip sorgente indicato dallo
+    script originale e ne leggiamo le righe JSONL direttamente.
+    """
+    import zipfile
+
+    url = HF_RAW_ZIP_URLS[config_name]
+    zip_path = HF_RAW_CACHE_DIR / f"{config_name}-dataset.zip"
+    if not zip_path.exists():
+        print(f"[hf-ingest] scarico {url} -> {zip_path}")
+        _download_with_resume(url, zip_path)
+
+    split_file = {"train": "train.txt", "validation": "val.txt", "test": "test.txt"}[split]
+    inner_path = f"{config_name}-dataset/{split_file}"
+
+    with zipfile.ZipFile(zip_path) as zf:
+        with zf.open(inner_path) as f:
+            for line in f:
+                d = json.loads(line)
+                yield {
+                    "article": "\n".join(d["article_text"]),
+                    "abstract": "\n".join(d["abstract_text"]).replace("<S>", "").replace("</S>", ""),
+                    "section_names": "\n".join(d["section_names"]),
+                }
+
+
+HF_INGEST_STATE_PATH = Path("hf_ingest_state.json")
+
+
+def _load_ingest_state() -> Dict:
+    if HF_INGEST_STATE_PATH.exists():
+        with open(HF_INGEST_STATE_PATH) as f:
+            return json.load(f)
+    return {"next_index": 0, "n_docs": 0, "n_chunks": 0}
+
+
+def _save_ingest_state(state: Dict) -> None:
+    with open(HF_INGEST_STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def ingest_huggingface_dataset() -> None:
+    """
+    Scarica armanc/scientific_papers (config/split sopra) e per ogni paper
+    chunk-a + embedda il campo 'article', assegnandolo agli SLM esattamente
+    come faceva prima l'upload manuale di un PDF dall'interfaccia.
+
+    Resumibile: l'indice dell'ultimo paper processato è salvato in
+    HF_INGEST_STATE_PATH dopo ogni documento, quindi un crash (es. il limite
+    di parametri SQL di ChromaDB su cluster molto grandi, o un errore di
+    rete) non costringe a ripartire da zero al riavvio di app.py.
+    """
+    state = _load_ingest_state()
+    start_index = state["next_index"]
+    if MAX_DOCS is not None and start_index >= MAX_DOCS:
+        print(f"[hf-ingest] Ingestion già completata ({start_index}/{MAX_DOCS} paper), salto.")
+        return
+
     collection = chroma_client.get_or_create_collection(
-        col_name,
-        metadata={"hnsw:space": "cosine"}
+        HF_COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
     )
-    chunks, _, profile_summary = process_pdf(
-        pdf_path=pdf_file,
-        collection=collection,
-        embedding_model=embedding_model,
+    spacy_fn = make_spacy_summary_fn(SPACY_SUMMARY_MODEL)
+
+    print(
+        f"[hf-ingest] {HF_DATASET_NAME}/{HF_DATASET_CONFIG} "
+        f"split={HF_DATASET_SPLIT} (max_docs={MAX_DOCS or 'tutti'})"
+        + (f" — riprendo da indice {start_index}" if start_index else "")
     )
+    # Lo zip sorgente (~3.6GB, tutti gli split di questa config) viene
+    # scaricato una sola volta in HF_RAW_CACHE_DIR; i run successivi lo
+    # riusano dalla cache locale senza ri-scaricarlo.
+    ds_iter = _iter_scientific_papers(HF_DATASET_CONFIG, HF_DATASET_SPLIT)
 
-    assignments, _strategy = assign_chunks_auto(chunks, embedding_model, col_name, chroma_client, threshold=0.55)
-    merges = merge_close_slms(threshold=0.88, embedding_model=embedding_model, chroma_client=chroma_client)
+    n_docs = state["n_docs"]
+    n_chunks = state["n_chunks"]
+    for i, example in enumerate(ds_iter):
+        if MAX_DOCS is not None and i >= MAX_DOCS:
+            break
+        if i < start_index:
+            continue  # già processato in una run precedente
 
-    spacy_fn = make_spacy_summary_fn("it_core_news_lg")
-    n_refreshed = refresh_all_summaries(embedding_model, chroma_client, summary_fn=spacy_fn)
-    summary_line = f"\n{n_refreshed} SLM keyword estratte con SpaCy."
+        article = (example.get("article") or "").strip()
+        if article:
+            chunks, _doc_type, _profile_summary = process_text(
+                text=article,
+                collection=collection,
+                embedding_model=embedding_model,
+                chapter_label=f"paper_{i:06d}",
+            )
+            if chunks:
+                assign_chunks_auto(
+                    chunks, embedding_model, HF_COLLECTION_NAME, chroma_client,
+                    threshold=ASSIGN_THRESHOLD
+                )
+                n_docs += 1
+                n_chunks += len(chunks)
 
-    merge_line = f"\n{len(merges)} SLM uniti per prossimità." if merges else ""
-    summary = (
-        f"{len(chunks)} chunk salvati nella collection '{col_name}'.\n"
-        f"Documento rilevato: {profile_summary}\n"
-        f"{len(assignments)} SLM aggiornati nel registry.{merge_line}{summary_line}"
+        state = {"next_index": i + 1, "n_docs": n_docs, "n_chunks": n_chunks}
+        _save_ingest_state(state)
+
+        if n_docs and n_docs % REFRESH_EVERY_N_DOCS == 0:
+            merges = merge_close_slms(
+                threshold=MERGE_THRESHOLD, embedding_model=embedding_model, chroma_client=chroma_client
+            )
+            refresh_all_summaries(embedding_model, chroma_client, summary_fn=spacy_fn)
+            print(
+                f"[hf-ingest] {n_docs} paper processati, {n_chunks} chunk totali, "
+                f"{len(merges)} merge nell'ultimo batch."
+            )
+
+    # Passata finale, copre l'ultimo batch parziale non ancora allineato a REFRESH_EVERY_N_DOCS
+    merges = merge_close_slms(
+        threshold=MERGE_THRESHOLD, embedding_model=embedding_model, chroma_client=chroma_client
     )
-    preview_data = [
-        {"id": c["id"][:8] + "...", "chapter": c["chapter"], "text": c["text"][:130] + "..."}
-        for c in chunks[:5]
-    ]
-    preview = json.dumps(preview_data, indent=2, ensure_ascii=False)
-    return summary, preview, gr.update(choices=get_collections()), get_registry_display()
+    refresh_all_summaries(embedding_model, chroma_client, summary_fn=spacy_fn)
+    print(
+        f"[hf-ingest] Completato: {n_docs} paper, {n_chunks} chunk, "
+        f"{len(load_registry())} SLM nel registry."
+    )
 
 
 # ── Query ──────────────────────────────────────────────────────────────
@@ -154,24 +298,27 @@ def _retrieve_hybrid(
         if col is None:
             continue
 
-        data = col.get(ids=chunk_ids, include=["embeddings", "documents", "metadatas"])
-        embeddings = data.get("embeddings")
-        documents  = data.get("documents") or []
-        metadatas  = data.get("metadatas") or []
+        # Paginated: ChromaDB's SQLite backend caps bound parameters per query,
+        # and a merged SLM cluster can hold far more chunk ids than that.
+        for batch_ids in _batched(chunk_ids, CHROMA_GET_BATCH_SIZE):
+            data = col.get(ids=batch_ids, include=["embeddings", "documents", "metadatas"])
+            embeddings = data.get("embeddings")
+            documents  = data.get("documents") or []
+            metadatas  = data.get("metadatas") or []
 
-        if embeddings is None or len(embeddings) == 0:
-            continue
+            if embeddings is None or len(embeddings) == 0:
+                continue
 
-        for i, emb in enumerate(embeddings):
-            e = np.array(emb, dtype=np.float32)
-            e_norm = float(np.linalg.norm(e))
-            dense_score = float(np.dot(query_emb, e) / (q_norm * e_norm)) if e_norm > 0 else 0.0
-            all_chunks.append({
-                "text":        documents[i] if i < len(documents) else "",
-                "meta":        metadatas[i] if i < len(metadatas) else {},
-                "slm":         slm_name,
-                "dense_score": dense_score,
-            })
+            for i, emb in enumerate(embeddings):
+                e = np.array(emb, dtype=np.float32)
+                e_norm = float(np.linalg.norm(e))
+                dense_score = float(np.dot(query_emb, e) / (q_norm * e_norm)) if e_norm > 0 else 0.0
+                all_chunks.append({
+                    "text":        documents[i] if i < len(documents) else "",
+                    "meta":        metadatas[i] if i < len(metadatas) else {},
+                    "slm":         slm_name,
+                    "dense_score": dense_score,
+                })
 
     if not all_chunks:
         return [], [], [], []
@@ -604,48 +751,6 @@ with gr.Blocks(
 
     with gr.Tabs():
 
-        # ── INGESTION ──────────────────────────────────────────────────
-        with gr.TabItem("Ingestion"):
-            with gr.Column(elem_id="ingestion-card"):
-                with gr.Column(elem_id="ing-hdr"):
-                    gr.HTML(
-                        "<h1>PDF Ingestion</h1>"
-                        "<p>chunking · embedding · SLM routing · merge</p>"
-                    )
-
-                pdf_input = gr.File(
-                    label="Documento PDF",
-                    file_types=[".pdf"],
-                    type="filepath"
-                )
-                collection_input = gr.Textbox(
-                    label="Nome Collection",
-                    placeholder="es. optimization_collection"
-                )
-                run_btn = gr.Button("Avvia Chunking", variant="primary")
-
-                gr.HTML('<hr class="divider">')
-
-                status_out = gr.Textbox(
-                    label="Stato", interactive=False, elem_id="status"
-                )
-                preview_out = gr.Textbox(
-                    label="Anteprima — primi 5 chunk",
-                    lines=8, interactive=False, elem_id="preview"
-                )
-                collections_out = gr.Dropdown(
-                    label="Collection in ChromaDB",
-                    choices=get_collections(),
-                    interactive=False
-                )
-
-                gr.HTML('<hr class="divider">')
-
-                registry_out = gr.Textbox(
-                    label="Registry SLM",
-                    lines=10, interactive=False, elem_id="registry"
-                )
-
         # ── QUERY ──────────────────────────────────────────────────────
         with gr.TabItem("Query"):
             with gr.Column(elem_id="query-card"):
@@ -687,11 +792,6 @@ with gr.Blocks(
                         )
 
     # ── Events ─────────────────────────────────────────────────────────
-    run_btn.click(
-        fn=upload_and_chunk,
-        inputs=[pdf_input, collection_input],
-        outputs=[status_out, preview_out, collections_out, registry_out]
-    )
     query_btn.click(
         fn=query_fn,
         inputs=[query_input, model_input],
@@ -699,6 +799,12 @@ with gr.Blocks(
     )
 
 if __name__ == "__main__":
+    # ingest_huggingface_dataset() è resumibile (vedi HF_INGEST_STATE_PATH):
+    # se una run precedente si è fermata a metà (crash, rete, ecc.) riprende
+    # dall'ultimo paper processato invece di ripartire da zero o saltare
+    # l'ingestion sulla sola base di un registry.json non vuoto.
+    ingest_huggingface_dataset()
+
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,

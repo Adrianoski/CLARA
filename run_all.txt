@@ -1,0 +1,89 @@
+nohup: ignoring input
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights: 100%|██████████| 391/391 [00:00<00:00, 78490.13it/s]
+[router] spaCy inizializzato con 'en_core_web_lg'.
+[hf-ingest] armanc/scientific_papers/arxiv split=train (max_docs=2000)
+[router] Modello summary deallocato.
+[hf-ingest] 50 paper processati, 2551 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 100 paper processati, 5673 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 150 paper processati, 8374 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 200 paper processati, 10671 chunk totali, 2 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 250 paper processati, 13169 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 300 paper processati, 15366 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 350 paper processati, 18158 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 400 paper processati, 20643 chunk totali, 2 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 450 paper processati, 23070 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 500 paper processati, 25637 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 550 paper processati, 27859 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 600 paper processati, 29991 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 650 paper processati, 32716 chunk totali, 2 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 700 paper processati, 35432 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 750 paper processati, 37942 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 800 paper processati, 40620 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 850 paper processati, 42948 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 900 paper processati, 45140 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 950 paper processati, 47588 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1000 paper processati, 50110 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1050 paper processati, 52557 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1100 paper processati, 54695 chunk totali, 2 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1150 paper processati, 57500 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1200 paper processati, 60523 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1250 paper processati, 63382 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1300 paper processati, 66593 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1350 paper processati, 68802 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1400 paper processati, 71741 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1450 paper processati, 74200 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1500 paper processati, 76406 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1550 paper processati, 78689 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1600 paper processati, 81117 chunk totali, 2 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1650 paper processati, 83569 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1700 paper processati, 86046 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1750 paper processati, 88866 chunk totali, 2 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1800 paper processati, 90962 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1850 paper processati, 94242 chunk totali, 1 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1900 paper processati, 96569 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 1950 paper processati, 98977 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] 2000 paper processati, 101542 chunk totali, 0 merge nell'ultimo batch.
+[router] Modello summary deallocato.
+[hf-ingest] Completato: 2000 paper, 101542 chunk, 32 SLM nel registry.
+* Running on local URL:  http://0.0.0.0:7860
+* To create a public link, set `share=True` in `launch()`.

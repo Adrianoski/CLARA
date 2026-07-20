@@ -241,3 +241,81 @@ def process_pdf(
     )
 
     return chunks, doc_type, profile_summary
+
+
+# ── Plain-text entry point (no PDF/OCR parsing) ────────────────────────
+
+def process_text(
+    text: str,
+    collection: chromadb.Collection,
+    embedding_model: SentenceTransformer,
+    chapter_label: str = "Document",
+    doc_type: str = "paper",
+    chunk_size: int = None,
+    overlap: int = None,
+) -> Tuple[List[Dict], str, str]:
+    """
+    Chunk and embed text that has already been extracted elsewhere (e.g. a
+    dataset field), skipping the PDF/Markdown parsing done by process_pdf.
+
+    Args:
+        chapter_label: value stored as the 'chapter' metadata for every chunk
+                        produced from this text (there is no heading structure
+                        to derive it from, unlike extract_chapters()).
+        doc_type:       chunking profile to use (see CHUNKING_PROFILES); defaults
+                        to 'paper' since this entry point is used for scientific
+                        paper corpora.
+
+    Returns:
+        (chunks, doc_type, profile_summary) — same shape as process_pdf.
+    """
+    splitter, profile = get_chunker(doc_type)
+
+    if chunk_size is not None or overlap is not None:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size or profile["chunk_size"],
+            chunk_overlap=overlap or profile["chunk_overlap"],
+            separators=["\n\n", "\n", ".", " ", ""],
+            length_function=len,
+        )
+        profile = {
+            "chunk_size":    chunk_size or profile["chunk_size"],
+            "chunk_overlap": overlap or profile["chunk_overlap"],
+        }
+
+    profile_summary = (
+        f"tipo={doc_type}  "
+        f"chunk_size={profile['chunk_size']}  "
+        f"overlap={profile['chunk_overlap']}"
+    )
+
+    raw_chunks = [t.strip() for t in splitter.split_text(text)]
+    raw_chunks = [t for t in raw_chunks if t]
+    if not raw_chunks:
+        return [], doc_type, profile_summary
+
+    embeddings = embedding_model.encode(
+        raw_chunks,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        batch_size=32,
+        show_progress_bar=False,
+    )
+
+    chunks = []
+    for i, raw_text in enumerate(raw_chunks):
+        chunks.append({
+            "id":        str(uuid.uuid4()),
+            "text":      raw_text,
+            "chapter":   chapter_label,
+            "embedding": embeddings[i].tolist(),
+        })
+
+    collection.add(
+        ids=[c["id"] for c in chunks],
+        embeddings=[c["embedding"] for c in chunks],
+        documents=[c["text"] for c in chunks],
+        metadatas=[{"chapter": c["chapter"]} for c in chunks],
+    )
+
+    return chunks, doc_type, profile_summary

@@ -92,6 +92,17 @@ def _update_centroid(
 
 # ── All-chunk text retrieval ───────────────────────────────────────────
 
+# ChromaDB's SQLite backend caps bound parameters per query (SQLITE_MAX_VARIABLE_NUMBER,
+# commonly 999). SLM clusters can grow past that after enough merges, so any
+# col.get(ids=...) over a whole cluster must be paginated.
+CHROMA_GET_BATCH_SIZE: int = 500
+
+
+def _batched(seq: List, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def _get_all_chunk_texts(
     chunk_ids: List[str],
     chroma_client,
@@ -104,16 +115,22 @@ def _get_all_chunk_texts(
     keywords extracted by the summary LLM cover the full semantic breadth of
     the cluster, not just its core or boundary.
 
+    Fetched in batches of CHROMA_GET_BATCH_SIZE ids to stay under ChromaDB's
+    per-query bound-parameter limit for large clusters.
+
     Returns:
-        List of chunk text strings in ChromaDB storage order.
+        List of chunk text strings (order not guaranteed).
     """
     try:
         col = chroma_client.get_collection(collection_name)
     except Exception:
         return []
 
-    data = col.get(ids=chunk_ids, include=["documents"])
-    return data.get("documents") or []
+    texts: List[str] = []
+    for batch_ids in _batched(chunk_ids, CHROMA_GET_BATCH_SIZE):
+        data = col.get(ids=batch_ids, include=["documents"])
+        texts.extend(data.get("documents") or [])
+    return texts
 
 
 def unload_summary_model() -> None:
@@ -157,13 +174,92 @@ _NOISE_SINGLE_WORDS = frozenset([
 ])
 
 # PDF artifact prefixes (line-break markers, encoding artifacts)
-_KW_ARTIFACT_PREFIXES = ("br ", "c3 ", "c2 ", "br\n", "_")
+_KW_ARTIFACT_PREFIXES = ("br ", "c3 ", "c2 ", "br\n", "_", "@", "\\")
+
+# arXiv/LaTeX artifact noise (single-word keywords to drop): placeholder tokens
+# left by the scientific_papers preprocessing (@xmath/@xcite → xmath/xcite once
+# '@' is stripped), structural words, and figure/table references.
+_ARXIV_NOISE_WORDS = frozenset([
+    "xmath", "xcite", "noop", "eq", "eqs", "fig", "figs", "figure", "table",
+    "section", "sec", "chunk", "ref", "refs", "cite", "et al", "al",
+    "ptabularcr", "tabular", "rectangle", "circle", "arrow", "dash",
+    "doibase", "link", "http", "https", "www",
+])
+
+
+# ── arXiv text cleaning (pre keyword-extraction) ───────────────────────
+
+# @xmath12, @xcite, @xnmath … placeholder tokens from the arXiv dump
+_ARXIV_PLACEHOLDER = re.compile(r'@x?[a-z]+\d*')
+# residual latex commands: \frac, \nonumber, \operatorname …
+_LATEX_COMMAND     = re.compile(r'\\[a-zA-Z]+\*?')
+# table column specs standing alone: "ccccc", "llccc", "rcl" …
+_TABLE_COLSPEC     = re.compile(r'\b[lcr]{3,}\b')
+# runs of underscores / repeated separators
+_UNDERSCORE_RUN    = re.compile(r'_{2,}')
+
+
+def _clean_arxiv_text(text: str) -> str:
+    """
+    Strip LaTeX/arXiv artifacts from chunk text before keyword extraction.
+
+    The armanc/scientific_papers dump replaces math and citations with
+    placeholder tokens (@xmath12, @xcite) and keeps raw table rows; spaCy
+    happily extracts these as 'entities', polluting the SLM keyword profiles
+    (observed in registry.json: '@noop', 'ptabularcr', whole table rows).
+    Dropping table-like lines and placeholders leaves only the prose the
+    keyword extraction is meant to see.
+    """
+    lines = []
+    for line in text.split("\n"):
+        # righe-tabella: molti separatori & o + (righe dati di tabelle latex)
+        if line.count("&") >= 3 or line.count(" + ") >= 3:
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines)
+
+    cleaned = _ARXIV_PLACEHOLDER.sub(" ", cleaned)
+    cleaned = _LATEX_COMMAND.sub(" ", cleaned)
+    cleaned = _TABLE_COLSPEC.sub(" ", cleaned)
+    cleaned = _UNDERSCORE_RUN.sub(" ", cleaned)
+    cleaned = re.sub(r'[{}$^~|]', " ", cleaned)
+    cleaned = re.sub(r'\s{2,}', " ", cleaned)
+    return cleaned.strip()
+
+
+# Forma ammessa per una keyword: solo lettere (accentate incluse), cifre,
+# spazi e trattini. Esclude label LaTeX (underscore), URL, formule (=, /, :),
+# riferimenti tipo "eq.([...]" — tutto junk che il c-TF-IDF altrimenti premia
+# perché massimamente "raro".
+_KW_ALLOWED_CHARS = re.compile(r"^[a-zA-Z0-9À-ÿ\s\-]+$")
+_KW_MAX_WORDS = 5
+# Nessuna parola inglese/francese comune supera i 20 caratteri: token più
+# lunghi sono quasi sempre label LaTeX concatenate ("maintheoremanditsconsequence").
+_KW_MAX_WORD_LEN = 20
+# Parole funzione francesi: ≥2 in una keyword ⇒ frammento di frase, non un
+# termine ("dans la proposition suivante"). Una sola è ammessa: "la sr cuo
+# systems" (lantanio!) è legittimo.
+_FRENCH_FUNCTION_WORDS = frozenset([
+    "dans", "une", "le", "la", "les", "des", "du", "est", "par", "pour",
+    "dun", "dune", "qui", "que", "sur", "avec", "nous", "sont", "comme",
+    "donc", "cette", "ces", "aux", "ont",
+])
 
 
 def _is_meaningful_kw(kw: str) -> bool:
     """Return True if kw is a keyword worth keeping — not noise, not a fragment."""
     kw = kw.strip()
     if len(kw) < 4:
+        return False
+    if len(kw) > 60 or "\n" in kw:
+        return False
+    if not _KW_ALLOWED_CHARS.match(kw):
+        return False
+    if len(kw.split()) > _KW_MAX_WORDS:
+        return False
+    if any(len(w) > _KW_MAX_WORD_LEN for w in kw.split()):
+        return False
+    if sum(1 for w in kw.lower().split() if w in _FRENCH_FUNCTION_WORDS) >= 2:
         return False
     # Starts with a digit: allow 4-digit years (1000-2100), reject page refs (1-3 digits)
     if kw[0].isdigit():
@@ -183,6 +279,13 @@ def _is_meaningful_kw(kw: str) -> bool:
         return False
     # Single-word structural noise
     if len(words) == 1 and words[0] in _NOISE_SINGLE_WORDS:
+        return False
+    # arXiv/LaTeX artifact noise: drop keywords made only of placeholder /
+    # structural tokens (xmath, xcite, fig, table…)
+    if all(w in _ARXIV_NOISE_WORDS for w in words):
+        return False
+    # Keyword containing placeholder fragments anywhere ("xmath12", "eq. four")
+    if any(w.startswith(("xmath", "xcite")) for w in words):
         return False
     return True
 
@@ -207,15 +310,19 @@ def _parse_raw_keywords(raw: str) -> List[str]:
     return result
 
 
-def _merge_keywords(keywords: List[str]) -> List[str]:
+def _merge_keywords_with_counts(keywords: List[str]) -> List[Tuple[str, int]]:
     """
-    Deduplicate and merge a flat list of keywords collected across all chunks.
+    Deduplicate and merge a flat list of keywords collected across all chunks,
+    returning (keyword, count) pairs sorted by frequency descending.
 
     Steps:
       1. Case-insensitive dedup — count occurrences, keep the most common casing.
       2. Substring absorption — if keyword A (normalized) is a substring of keyword B,
          A is dropped and its count is added to B (the more specific form wins).
       3. Sort by frequency descending so the most cross-chunk keywords come first.
+
+    I conteggi servono alla pesatura c-TF-IDF cross-cluster in
+    refresh_all_summaries (frequenza nel cluster × rarità negli altri cluster).
     """
     # Step 1: normalize and count
     freq: Dict[str, int] = {}       # norm → count
@@ -249,7 +356,12 @@ def _merge_keywords(keywords: List[str]) -> List[str]:
         if n not in absorbed and _is_meaningful_kw(canonical[n])
     ]
     result.sort(key=lambda x: -x[1])
-    return [kw for kw, _ in result]
+    return result
+
+
+def _merge_keywords(keywords: List[str]) -> List[str]:
+    """Come _merge_keywords_with_counts, ma restituisce solo le keyword (API storica)."""
+    return [kw for kw, _ in _merge_keywords_with_counts(keywords)]
 
 
 # Maximum prompts per GPU forward pass.
@@ -371,26 +483,121 @@ def update_slm_summary(
 
 # ── NEW: Batch summary refresh (call after full ingestion) ─────────────
 
+# Quante keyword distintive tenere per SLM dopo la pesatura c-TF-IDF.
+# 25 (non 15): con il routing max-sim per keyword un profilo più ricco copre
+# meglio l'ampiezza tematica di cluster da migliaia di chunk, senza il rischio
+# di "diluizione" che aveva l'embedding della stringa unica.
+CTFIDF_TOP_K: int = 25
+# Occorrenze minime nel cluster perché una keyword partecipi al ranking
+# c-TF-IDF: gli hapax (count 1-2) sono quasi sempre label/refusi che la
+# pesatura per rarità premierebbe proprio in quanto unici.
+CTFIDF_MIN_COUNT: int = 3
+
+
 def refresh_all_summaries(
     embedding_model: SentenceTransformer,
     chroma_client,
     summary_fn: Optional[SummaryFn] = None,
 ) -> int:
+    """
+    Rigenera keyword + summary_embedding per tutti gli SLM.
+
+    Se summary_fn espone la variante `with_counts` (make_spacy_summary_fn),
+    usa una pesatura c-TF-IDF a due fasi:
+      Fase A — estrae (keyword, conteggio) da ogni cluster;
+      Fase B — pesa ogni keyword per frequenza nel cluster × log-rarità negli
+               altri cluster (score = count × log((1+N)/(1+df))), tenendo le
+               top CTFIDF_TOP_K *distintive*.
+    Con il ranking per sola frequenza, parole generiche del corpus ("state",
+    "system", "model") dominavano ogni cluster e i summary embedding
+    risultavano quasi indistinguibili tra loro — il routing non discriminava.
+    Le keyword che compaiono in tutti i cluster hanno score 0 e spariscono.
+
+    Se summary_fn non espone i conteggi (es. Qwen), usa il vecchio flusso
+    single-pass per-cluster invariato.
+    """
     import gc
+    import math
     import torch
 
     registry = load_registry()
-    count = 0
-    for slm_name in list(registry.keys()):
-        update_slm_summary(registry, slm_name, embedding_model, chroma_client, summary_fn)
-        count += 1
+    fn_counts = getattr(summary_fn, "with_counts", None)
+
+    if fn_counts is None:
+        # ── Vecchio flusso single-pass (Qwen o summary_fn custom) ──────────
+        count = 0
+        for slm_name in list(registry.keys()):
+            update_slm_summary(registry, slm_name, embedding_model, chroma_client, summary_fn)
+            count += 1
+        save_registry(registry)
+
+        unload_summary_model()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return count
+
+    # ── Fase A: (keyword, count) per ogni SLM ──────────────────────────────
+    per_slm_counts: Dict[str, List[Tuple[str, int]]] = {}
+    for slm_name, entry in registry.items():
+        chunks_path = Path(entry["chunks_json"])
+        if not chunks_path.exists():
+            continue
+        with open(chunks_path) as f:
+            chunk_ids = [c["id"] for c in json.load(f)]
+        if not chunk_ids:
+            continue
+        texts = _get_all_chunk_texts(chunk_ids, chroma_client, entry["collection"])
+        if not texts:
+            continue
+        per_slm_counts[slm_name] = fn_counts(texts)
+
+    # ── Fase B: document frequency cross-cluster + reweighting ─────────────
+    n_clusters = len(per_slm_counts)
+    df: Dict[str, int] = {}
+    for counts in per_slm_counts.values():
+        for kw, _ in counts:
+            norm = kw.lower()
+            df[norm] = df.get(norm, 0) + 1
+
+    for slm_name, counts in per_slm_counts.items():
+        scored = [
+            (kw, c * math.log((1 + n_clusters) / (1 + df[kw.lower()])))
+            for kw, c in counts
+            if c >= CTFIDF_MIN_COUNT
+        ]
+        scored.sort(key=lambda x: -x[1])
+        top = [kw for kw, s in scored[:CTFIDF_TOP_K] if s > 0]
+        if not top:
+            # Nessuna keyword sopra la soglia o tutte presenti ovunque:
+            # fallback alle più frequenti per non lasciare il profilo vuoto.
+            top = [kw for kw, _ in counts[:CTFIDF_TOP_K]]
+
+        entry = registry[slm_name]
+        entry["topic_summary"] = ""
+        entry["keywords"] = top
+
+        routing_text = ", ".join(top)
+        entry["summary_embedding"] = embedding_model.encode(
+            [routing_text], normalize_embeddings=True, convert_to_numpy=True
+        )[0].tolist()
+
+        # Embedding per singola keyword, per il routing max-sim: al query time
+        # il cluster è agganciato dalla keyword più vicina alla query, non da
+        # una media in cui i termini si diluiscono a vicenda.
+        kw_embs = embedding_model.encode(
+            top, normalize_embeddings=True, convert_to_numpy=True
+        )
+        entry["keyword_embeddings"] = [e.tolist() for e in kw_embs]
+
     save_registry(registry)
 
     unload_summary_model()
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    return count
+    return n_clusters
 
 
 
@@ -626,19 +833,38 @@ def find_top_n_slms(
     query_embedding: np.ndarray,
     registry: Dict,
     n: int = 2,
+    mode: str = "summary",
 ) -> List[Tuple[str, float]]:
     """
-    Route a query to the top-n SLMs by cosine similarity with summary_embedding.
-    SLMs without a summary_embedding are skipped.
+    Route a query to the top-n SLMs by cosine similarity with the cluster's
+    semantic profile.
+
+    mode="summary"  (default): routing keyword-based (contributo del paper).
+        Se l'entry ha `keyword_embeddings` (una per keyword, scritte da
+        refresh_all_summaries), il punteggio del cluster è la MEDIA dei
+        coseni tra la query e le singole keyword del profilo. Sweep empirico
+        sulle 20 query di benchmark (recall@3/@5 dei cluster contenenti i
+        top-5 chunk di StdRAG): mean 46%/51% > stringa unica 37%/43% >
+        max-sim 16%/28% — il max amplifica i match spuri di keyword
+        rumorose, la media li smorza; la stringa unica è penalizzata
+        dall'essere out-of-distribution per bge-m3. In assenza di
+        keyword_embeddings ricade sul confronto con summary_embedding
+        (embedding della stringa concatenata, comportamento storico).
+    mode="centroid": confronta con centroid_embedding (media degli embedding
+        dei chunk). Baseline di confronto per l'ablation study.
 
     Args:
         query_embedding: normalized query embedding (1-D float32).
         registry:        loaded registry dict.
         n:               number of SLMs to return.
+        mode:            "summary" | "centroid".
 
     Returns:
         List of (slm_name, score) sorted descending.
     """
+    if mode not in ("summary", "centroid"):
+        raise ValueError(f"mode sconosciuto: {mode!r} (usare 'summary' o 'centroid')")
+
     q_norm = float(np.linalg.norm(query_embedding))
     if q_norm == 0:
         raise ValueError("Query embedding is a zero vector.")
@@ -646,20 +872,29 @@ def find_top_n_slms(
     scores: List[Tuple[str, float]] = []
 
     for slm_name, entry in registry.items():
-        summary_emb = entry.get("summary_embedding")
-        if not summary_emb:
+        if mode == "summary" and entry.get("keyword_embeddings"):
+            # Media dei coseni per keyword (embedding già normalizzati da refresh)
+            kw_matrix = np.array(entry["keyword_embeddings"], dtype=np.float32)
+            sims = kw_matrix @ (query_embedding / q_norm)
+            score = float(sims.mean())
+            scores.append((slm_name, score))
             continue
 
-        sv = np.array(summary_emb, dtype=np.float32)
-        sv_norm = float(np.linalg.norm(sv))
-        if sv_norm == 0:
+        emb_key = "summary_embedding" if mode == "summary" else "centroid_embedding"
+        profile_emb = entry.get(emb_key)
+        if not profile_emb:
             continue
 
-        score = float(np.dot(query_embedding, sv) / (q_norm * sv_norm))
+        pv = np.array(profile_emb, dtype=np.float32)
+        pv_norm = float(np.linalg.norm(pv))
+        if pv_norm == 0:
+            continue
+
+        score = float(np.dot(query_embedding, pv) / (q_norm * pv_norm))
         scores.append((slm_name, score))
 
     if not scores:
-        raise RuntimeError("Nessun SLM con summary_embedding valido. Esegui prima l'ingestion.")
+        raise RuntimeError(f"Nessun SLM con profilo di routing valido ({mode}). Esegui prima l'ingestion.")
 
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[:n]
@@ -792,9 +1027,13 @@ def migrate_centroids_to_summaries(
         except Exception:
             continue
 
-        data = col.get(ids=chunk_ids, include=["embeddings"])
-        embeddings = data.get("embeddings")
-        if embeddings is None or len(embeddings) == 0:
+        embeddings: List = []
+        for batch_ids in _batched(chunk_ids, CHROMA_GET_BATCH_SIZE):
+            data = col.get(ids=batch_ids, include=["embeddings"])
+            batch_embeddings = data.get("embeddings")
+            if batch_embeddings is not None and len(batch_embeddings) > 0:
+                embeddings.extend(batch_embeddings)
+        if not embeddings:
             continue
 
         arr = np.array(embeddings, dtype=np.float32)
@@ -853,8 +1092,13 @@ def make_spacy_summary_fn(
     # Label NER da tenere — esclude DATE, CARDINAL, ORDINAL, PERCENT (rumorose)
     _KEEP_LABELS = {"PER", "ORG", "GPE", "LOC", "MISC", "PRODUCT", "EVENT", "WORK_OF_ART"}
 
-    def _fn(texts: List[str]) -> Tuple[str, List[str]]:
+    def _extract_raw(texts: List[str]) -> List[str]:
+        """Estrae le keyword grezze (con ripetizioni) da tutti i chunk."""
         all_raw: List[str] = []
+
+        # Pulizia artefatti LaTeX/arXiv prima dell'estrazione: senza questa,
+        # spaCy estrae @xmath/@xcite/righe di tabella come "entità".
+        texts = [t for t in (_clean_arxiv_text(t) for t in texts) if t]
 
         # Processa tutti i chunk in batch (molto più veloce di uno alla volta)
         for doc in nlp.pipe(texts, batch_size=32, disable=["parser", "senter"]):
@@ -877,8 +1121,15 @@ def make_spacy_summary_fn(
                         if _is_meaningful_kw(kw):
                             all_raw.append(kw)
 
+        return all_raw
+
+    def _fn(texts: List[str]) -> Tuple[str, List[str]]:
         # Riusa _merge_keywords già presente nel router (dedup + absorption + freq sort)
-        return "", _merge_keywords(all_raw)
+        return "", _merge_keywords(_extract_raw(texts))
+
+    # Variante con conteggi, usata dal flusso c-TF-IDF di refresh_all_summaries
+    # (frequenza per keyword necessaria alla pesatura cross-cluster).
+    _fn.with_counts = lambda texts: _merge_keywords_with_counts(_extract_raw(texts))
 
     return _fn
 

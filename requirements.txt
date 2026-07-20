@@ -1,4 +1,6 @@
 gradio
+requests
+tqdm
 sentence-transformers
 chromadb
 PyMuPDF

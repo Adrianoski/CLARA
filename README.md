@@ -142,7 +142,8 @@ service ClusterAgent {
 
 ```bash
 pip install -r requirements.txt
-python -m spacy download it_core_news_lg
+python -m spacy download it_core_news_lg   # legacy PDF pipeline (chunking.process_pdf)
+python -m spacy download en_core_web_lg    # HF dataset ingestion (armanc/scientific_papers, English)
 ```
 
 ### Run the UI
@@ -151,6 +152,13 @@ python -m spacy download it_core_news_lg
 python app.py
 # → http://localhost:7860
 ```
+
+On first launch (empty `registry.json`), `app.py` streams
+`armanc/scientific_papers` (config `arxiv`, split `train`, capped at
+`MAX_DOCS` papers — see the constants at the top of `app.py`) straight from
+Hugging Face, chunks + embeds + clusters it into SLMs, then serves the Query
+tab. Subsequent launches skip re-ingestion as long as `registry.json` is
+already populated.
 
 ### Run the benchmark
 
